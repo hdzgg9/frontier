@@ -1,0 +1,8 @@
+# build artifacts
+build/
+log/
+install/
+
+# package, cmake
+*.txt
+*.xml
