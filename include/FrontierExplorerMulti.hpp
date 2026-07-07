@@ -36,6 +36,11 @@ static constexpr int UNKNOWN = -1;
 struct GridPose { int x{0}, y{0}; };
 struct WorldPose { double x{0}, y{0}, yaw{0}; };
 
+struct BlacklistedGoal {
+    GridPose g;
+    rclcpp::Time stamp;
+};
+
 static inline int IDX(int x, int y, int w) { return y * w + x; }
 static inline double clampd(double v, double lo, double hi) { return std::max(lo, std::min(hi, v)); }
 
@@ -63,6 +68,8 @@ private:
     GridPose worldToGrid(double wx, double wy) const;
     std::pair<double,double> gridToWorld(int gx, int gy) const;
     bool toGlobal(double x_local, double y_local, double& x_g, double& y_g);
+    bool toLocal(double x_g, double y_g, double& x_local, double& y_local);
+
 
     // (2) robot pose
     bool updateRobotPoseFromTF();
@@ -72,7 +79,7 @@ private:
     bool isFrontierCell(int x, int y) const;
     std::vector<GridPose> detectFrontiers(const GridPose &robot_g) const;
     void applyKeepOpen(std::vector<uint8_t>& mask, const GridPose& robot_g) const;
-    void applyGoalKeepOpen(std::vector<uint8_t>& mask, const GridPose& goal_g) const;
+    void applyGoalKeepOpen(std::vector<uint8_t>& mask, const GridPose& goal_g, const std::vector<uint8_t>& obsRaw) const;
     bool isFrontierTooCloseToObstacle(const GridPose& f,
                                     const std::vector<uint8_t>& obsRaw,
                                     int radius_cells) const;
@@ -139,6 +146,9 @@ private:
     void onScan(const sensor_msgs::msg::LaserScan::SharedPtr msg);
     void onTimer();
 
+    void addToBlacklist(const GridPose& g);
+    bool isBlacklisted(const GridPose& g) const;
+
     // ---------------------------------------------------------
     // 3. 멤버 변수들 
     // ---------------------------------------------------------
@@ -156,7 +166,8 @@ private:
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-    GridPose blacklisted_goal_ = {-1, -1};
+    std::vector<BlacklistedGoal> blacklisted_goals_;
+    double blacklist_ttl_s_{20.0};
     double blacklist_radius_m_ = 1.5;
 
     // ---------- Params / topics ----------
@@ -274,6 +285,24 @@ private:
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr explore_done_sub_;
     bool exploration_done_{false};
 
+    // 추가 | A* 연속 실패 카운트용
+    int gate_plan_fail_count_{0};
+    int gate_plan_fail_max_{3};
+
+    // 로컬 맵 폴백용
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr local_map_sub_;
+    nav_msgs::msg::OccupancyGrid merge_map_;
+    nav_msgs::msg::OccupancyGrid local_map_;
+    bool has_merge_map_{false};
+    bool has_local_map_{false};
+    rclcpp::Time last_merge_map_time_;
+    rclcpp::Time last_local_map_time_;
+    std::string local_map_topic_;
+    double merge_map_stale_s_{2.0};
+    bool using_local_map_{false};
+
+    void onLocalMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
+    void selectActiveMap();
 };
 
 #endif // FRONTIER_EXPLORER_MULTI_HPP_

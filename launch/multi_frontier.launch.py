@@ -97,7 +97,7 @@ def generate_launch_description():
         executable="static_transform_publisher",
         name="world_to_tb3_1_map",
         arguments=[
-            "--x", "0.0", "--y", "1.0", "--z", "0",
+            "--x", "1.956", "--y", "0.0", "--z", "0",
             "--yaw", "0", "--pitch", "0", "--roll", "0",
             "--frame-id", "world",
             "--child-frame-id", "tb3_1/map",

@@ -9,7 +9,7 @@ from launch.actions import TimerAction  # 추가
 def generate_launch_description():
     ld = LaunchDescription()
 
-    use_sim_time = False
+    use_sim_time = True
     pkg_dir = get_package_share_directory('frontier_ws')
     param_file = os.path.join(pkg_dir, 'config', 'params.yaml')
 
@@ -118,7 +118,7 @@ def generate_launch_description():
         executable="static_transform_publisher",
         name="world_to_tb3_1_map",
         arguments=[
-            "--x", "1.0", "--y", "1.0", "--z", "0",
+            "--x", "0.0", "--y", "0.0", "--z", "0",
             "--yaw", "0", "--pitch", "0", "--roll", "0",
             "--frame-id", "world",
             "--child-frame-id", "tb3_1/map",
@@ -175,6 +175,8 @@ def generate_launch_description():
                 "map_frame": "world",
                 "base_frame": f"{ns}/base_footprint",
                 "global_frame": "world",
+                "merge_map_stale_s": 5.0,   # gate_node.py의 merge_map_stale_s와 맞추기
+                "local_map_topic": "map",   # 명시적으로 남겨두면 나중에 헷갈릴 일 없음
             }],
         )
 

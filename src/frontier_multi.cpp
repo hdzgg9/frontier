@@ -80,11 +80,16 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
     cluster_marker_topic_  = this->declare_parameter<std::string>("cluster_marker_topic", "cluster_marker");
     
     // ====== Gate 관련 파라미터 추가 ======
-    gate_goal_topic_   = this->declare_parameter<std::string>("gate_goal_topic", "/goal_assignment");
+    gate_goal_topic_   = this->declare_parameter<std::string>("gate_goal_topic", "goal_assignment");
     map_delta_topic_   = this->declare_parameter<std::string>("map_delta_topic", "map_delta");
     gate_timeout_s_    = this->declare_parameter<double>("gate_timeout_s", 3.0);
     map_delta_period_s_= this->declare_parameter<double>("map_delta_period_s", 1.0);
 
+    blacklist_ttl_s_ = this->declare_parameter<double>("blacklist_ttl_s", 20.0);
+    gate_plan_fail_max_ = this->declare_parameter<int>("gate_plan_fail_max", 3);
+
+    local_map_topic_ = this->declare_parameter<std::string>("local_map_topic", "map"); // 상대경로 -> /<ns>/map
+    merge_map_stale_s_ = this->declare_parameter<double>("merge_map_stale_s", 5.0);
   }
 
   void FrontierExplorerMulti::setup_ros_interfaces(){
@@ -98,6 +103,10 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
       auto scan_qos = rclcpp::QoS(rclcpp::KeepLast(10));
       scan_qos.best_effort();
 
+    local_map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+    local_map_topic_, map_qos,
+    std::bind(&FrontierExplorerMulti::onLocalMap, this, std::placeholders::_1));
+
     scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
       scan_topic_, scan_qos, std::bind(&FrontierExplorerMulti::onScan, this, std::placeholders::_1));
 
@@ -108,7 +117,7 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
     // Gate로부터 goal 수신
     gate_goal_sub_ =
     this->create_subscription<geometry_msgs::msg::PoseStamped>(
-        "/" + robot_id_ + "/goal_assignment",
+        gate_goal_topic_,
         10,
         std::bind(
             &FrontierExplorerMulti::onGateGoal,
@@ -216,53 +225,43 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
 }
 
     void FrontierExplorerMulti::onGateGoal(
-    const geometry_msgs::msg::PoseStamped::SharedPtr msg)
-{
-    double dist = 999.0;
+      const geometry_msgs::msg::PoseStamped::SharedPtr msg)
+  {
+      double dist = 999.0;
 
-    // 이전 goal이 있었으면
-    if (has_gate_goal_) {
+      if (has_gate_goal_) {
+          double dx = msg->pose.position.x - gate_goal_.pose.position.x;
+          double dy = msg->pose.position.y - gate_goal_.pose.position.y;
+          dist = std::hypot(dx, dy);
+      }
 
-        double dx =
-            msg->pose.position.x -
-            gate_goal_.pose.position.x;
+      // ------------------------------------------------
+      // timeout은 goal을 받을 때마다 무조건 갱신
+      // (같은 goal이 유지 신호로 재전송되는 경우까지 포함)
+      // ------------------------------------------------
+      last_gate_goal_time_ = this->now();
 
-        double dy =
-            msg->pose.position.y -
-            gate_goal_.pose.position.y;
+      // replan 트리거(new_gate_goal_)는 "진짜 새로운 위치"일 때만
+      if (!has_gate_goal_ || dist > 0.3) {
+          new_gate_goal_ = true;
 
-        dist = std::hypot(dx, dy);
-    }
+          RCLCPP_WARN(
+              get_logger(),
+              "[%s] NEW Gate goal received: (%.2f, %.2f)",
+              robot_id_.c_str(),
+              msg->pose.position.x,
+              msg->pose.position.y);
+      }
+      else {
+          RCLCPP_WARN(
+              get_logger(),
+              "[%s] SAME Gate goal -> timeout 갱신, 경로 유지",
+              robot_id_.c_str());
+      }
 
-    // ------------------------------------------------
-    // 진짜 새로운 goal일 때만 timeout 갱신
-    // ------------------------------------------------
-    if (!has_gate_goal_ || dist > 0.3) {
-
-        last_gate_goal_time_ = this->now();
-
-        new_gate_goal_ = true;
-
-        RCLCPP_WARN(
-            get_logger(),
-            "[%s] NEW Gate goal received: (%.2f, %.2f)",
-            robot_id_.c_str(),
-            msg->pose.position.x,
-            msg->pose.position.y);
-    }
-
-    else {
-
-        RCLCPP_WARN(
-            get_logger(),
-            "[%s] SAME Gate goal -> timeout 유지",
-            robot_id_.c_str());
-    }
-
-    gate_goal_ = *msg;
-
-    has_gate_goal_ = true;
-}
+      gate_goal_ = *msg;
+      has_gate_goal_ = true;
+  }
 
 
   bool FrontierExplorerMulti::toGlobal(double x_local, double y_local, double& x_g, double& y_g) {
@@ -286,6 +285,29 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
       return true;
     } catch (...) {
       return false;
+    }
+  }
+
+  bool FrontierExplorerMulti::toLocal(double x_g, double y_g, double& x_local, double& y_local) {
+    geometry_msgs::msg::PoseStamped in;
+    in.header.stamp = this->now();
+    in.header.frame_id = global_frame_;
+    in.pose.position.x = x_g;
+    in.pose.position.y = y_g;
+    in.pose.position.z = 0.0;
+    in.pose.orientation.w = 1.0;
+
+    try {
+        auto tf = tf_buffer_->lookupTransform(
+            map_frame_, global_frame_, tf2::TimePointZero,
+            tf2::durationFromSec(tf_timeout_s_));
+        geometry_msgs::msg::PoseStamped out;
+        tf2::doTransform(in, out, tf);
+        x_local = out.pose.position.x;
+        y_local = out.pose.position.y;
+        return true;
+    } catch (...) {
+        return false;
     }
   }
 
@@ -375,31 +397,43 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
 
   void FrontierExplorerMulti::applyGoalKeepOpen(
     std::vector<uint8_t>& mask,
-    const GridPose& goal_g) const
+    const GridPose& goal_g,
+    const std::vector<uint8_t>& obsRaw) const
 {
     int W = (int)map_.info.width;
-
     int R = 4;
+    double res = map_.info.resolution;
+
+    // 실제 장애물로부터 최소 이만큼은 띄워서 열기 (벽 스침 방지)
+    double min_clear_m = std::min(inflation_radius_m_,
+                                   path_clearance_m_ > 0.0 ? path_clearance_m_ : inflation_radius_m_ * 0.5);
+    int clear_cells = (int)std::ceil(min_clear_m / res);
 
     for (int dy=-R; dy<=R; ++dy) {
         for (int dx=-R; dx<=R; ++dx) {
-
             int nx = goal_g.x + dx;
             int ny = goal_g.y + dy;
-
-            if (!inBounds(nx, ny))
-                continue;
+            if (!inBounds(nx, ny)) continue;
 
             int idx = IDX(nx, ny, W);
-
             int v = map_.data[idx];
 
-            // frontier goal 주변은 unknown/free 모두 열기
-            if (v == UNKNOWN ||
-                (v >= 0 && v <= free_threshold_))
-            {
-                mask[idx] = 0;
+            // 자체가 실제 장애물 셀이면 열지 않음
+            if (!(v == UNKNOWN || (v >= 0 && v <= free_threshold_))) continue;
+
+            // 주변 min_clear_m 반경 안에 실제 장애물이 있으면 열지 않음
+            bool too_close = false;
+            for (int cy=-clear_cells; cy<=clear_cells && !too_close; ++cy) {
+                for (int cx=-clear_cells; cx<=clear_cells; ++cx) {
+                    if (std::hypot(cx, cy) * res > min_clear_m) continue;
+                    int ox = nx + cx, oy = ny + cy;
+                    if (!inBounds(ox, oy)) continue;
+                    if (obsRaw[IDX(ox, oy, W)]) { too_close = true; break; }
+                }
             }
+            if (too_close) continue;
+
+            mask[idx] = 0;
         }
     }
 }
@@ -949,8 +983,7 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
     auto now = this->now();
 
     for (auto it = reservations_.begin(); it != reservations_.end();) {
-      double diff = (now - it->second.stamp).seconds();
-        // 시뮬레이션에서는 가끔 시간이 튀어서 diff가 마이너스가 될 수 있으니 -1.0초까지 허용
+        double diff = (now - it->second.stamp).seconds();
         if (diff > reserve_ttl_s_ || diff < -1.0) {
             it = reservations_.erase(it);
         } else {
@@ -959,17 +992,21 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
     }
 
     if (reservations_.empty()) {
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "[%s] 장부가 텅 비어있음!", robot_id_.c_str());
+        // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        //     "[%s] 장부가 텅 비어있음!", robot_id_.c_str());
         return 0.0;
     }
 
+    double max_penalty = 0.0;
     for (const auto& kv : reservations_) {
-      double d = std::hypot(goal_x_g - kv.second.x, goal_y_g - kv.second.y);
-      RCLCPP_WARN(this->get_logger(), "검사중: %s 의 예약위치와 후보지 거리 = %.2f", kv.first.c_str(), d);
-      if (d < reserve_exclusion_radius_m_) return 1.0;
+        double d = std::hypot(goal_x_g - kv.second.x, goal_y_g - kv.second.y);
+        if (d >= reserve_exclusion_radius_m_) continue;
+        // 예약 지점에 가까울수록 1.0에 가까운 페널티, 반경 경계에서 0.0
+        double p = 1.0 - (d / reserve_exclusion_radius_m_);
+        if (p > max_penalty) max_penalty = p;
     }
-    return 0.0;
-  }
+    return max_penalty; // 0.0 ~ 1.0
+}
 
 
   bool FrontierExplorerMulti::pickBestFrontierByUtility(
@@ -1014,12 +1051,8 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
     if (d0 < min_goal_dist_m) continue;
 
     // 블랙리스트 체크
-    if (blacklisted_goal_.x >= 0) {
-        double d_black = std::hypot(
-            (g.x - blacklisted_goal_.x) * map_.info.resolution,
-            (g.y - blacklisted_goal_.y) * map_.info.resolution);
-        if (d_black < blacklist_radius_m_) continue;
-    }
+    if (isBlacklisted(g)) continue;
+
 
     //  A* 돌리기 전에 좌표 변환부터 먼저
     auto [wx, wy] = gridToWorld(g.x, g.y);
@@ -1028,7 +1061,7 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
 
     // 남이 예약했는지 확인해서, 예약된 곳이면 아예 여기서 컷
     double rp = reservePenaltyGlobal(gx, gy);
-    if (rp > 0.5) { 
+    if (rp > 0.9) { 
         // 예약된 곳이면 굳이 A* 경로를 안 짜고 다음 프론티어 후보로
         continue; 
     }
@@ -1036,6 +1069,7 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
     // 통과한 안전한(예약 안 된) 목표점만 A* 로 경로 생성
     auto astarMask = obsInfl;
     applyKeepOpen(astarMask, robot_g);
+    applyGoalKeepOpen(astarMask, g, obsRaw);   // 4번 항목: local goal에도 적용
   
     auto p = astar(robot_g, g, astarMask);
     if (p.empty()) continue; 
@@ -1045,8 +1079,8 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
     double path_len = (double)p.size() * map_.info.resolution;
     double ig = infoGainAround(g, ig_cells);
 
-    // rp 계산은 위에서 이미 했으므로 아래 코드 수정
-    double score = alpha_ * ig - beta_ * path_len; 
+    // delta_를 soft penalty로 실제 반영
+    double score = alpha_ * ig - beta_ * path_len - delta_ * rp; 
 
     // 계산한 score를 기반으로 가장 높은 score를 가지는 goal 값을 선택하여 생성된 경로로 따라가기
     if (score > bestScore) {
@@ -1256,40 +1290,33 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
 
     auto now = this->now();
 
-    // 너무 자주 체크하지 않기
     if ((now - last_replan_check_).seconds() < replan_check_period_s_) return false;
     last_replan_check_ = now;
 
-    // 목표를 잡은지 너무 짧으면 안 바꾸기(덜덜 떨림 방지)
     if ((now - goal_commit_start_).seconds() < min_commit_time_s_) return false;
 
-    // ===== NEW =====
-    int ig_radius =
-        (int)std::ceil(info_gain_radius_m_
-            / map_.info.resolution);
-
-    double ig =
-        infoGainAround(current_goal_, ig_radius);
+    int ig_radius = (int)std::ceil(info_gain_radius_m_ / map_.info.resolution);
+    double ig = infoGainAround(current_goal_, ig_radius);
 
     if (ig < ig_drop_thresh_) {
-
         RCLCPP_WARN(this->get_logger(),
-            "[%s][REPLAN] 정보량 감소 ig=%.2f",
-            robot_id_.c_str(), ig);
-
+            "[%s][REPLAN] 정보량 감소 ig=%.2f (gate=%d)",
+            robot_id_.c_str(), ig, has_gate_goal_);
         return true;
     }
+
+    // Gate goal일 때는 예약 충돌 체크는 Gate가 이미 관리하므로 스킵
+    if (has_gate_goal_) return false;
 
     auto [wx, wy] = gridToWorld(current_goal_.x, current_goal_.y);
     double gx, gy;
     if (!toGlobal(wx, wy, gx, gy)) return false;
 
-    // 남이 내 목표 지점을 예약했는지 확인
     double rp = reservePenaltyGlobal(gx, gy);
 
     if (rp > 0.5) {
         RCLCPP_WARN(this->get_logger(), "[%s][REPLAN] 내 목표 지점이 선점됨! 경로 재설정.", robot_id_.c_str());
-        return true; 
+        return true;
     }
     return false;
   }
@@ -1412,7 +1439,7 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
       
       // A. 실제 모양 (POINTS) 마커 설정
       visualization_msgs::msg::Marker points_marker;
-      points_marker.header.frame_id = "world";
+      points_marker.header.frame_id = map_frame_;
       points_marker.header.stamp = now;
       points_marker.ns = robot_id_ + "_full_shape";
       points_marker.id = i;
@@ -1469,16 +1496,85 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
   
 
   void FrontierExplorerMulti::onMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
-    map_ = *msg;
-    has_map_ = true;
+    merge_map_ = *msg;
+    has_merge_map_ = true;
+    last_merge_map_time_ = this->now();
     RCLCPP_INFO(this->get_logger(), "메시지 frame_id: %s", msg->header.frame_id.c_str());
+  }
+
+  void FrontierExplorerMulti::onLocalMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
+    local_map_ = *msg;
+    has_local_map_ = true;
+    last_local_map_time_ = this->now();
+  }
+
+  void FrontierExplorerMulti::selectActiveMap() {
+    auto now = this->now();
+    bool merge_fresh = has_merge_map_ &&
+        (now - last_merge_map_time_).seconds() < merge_map_stale_s_;
+
+    bool want_local = !merge_fresh && has_local_map_;
+
+    if (want_local != using_local_map_) {
+        // 전환 발생 -> frame/좌표계가 바뀌므로 기존 경로/상태 폐기
+        RCLCPP_WARN(get_logger(), "[%s] map source switch -> %s",
+                    robot_id_.c_str(), want_local ? "LOCAL" : "MERGE");
+        path_.clear();
+        wp_idx_ = 0;
+        has_goal_ = false;
+        has_gate_goal_ = false;
+        blacklisted_goals_.clear();
+        prev_map_data_.clear();  // map_delta 계산도 리셋
+        using_local_map_ = want_local;
+    }
+
+    if (using_local_map_) {
+        map_ = local_map_;
+        map_frame_ = local_map_.header.frame_id.empty()
+            ? map_frame_ : local_map_.header.frame_id;
+        has_map_ = has_local_map_;
+    } else if (merge_fresh) {
+        map_ = merge_map_;
+        map_frame_ = merge_map_.header.frame_id.empty()
+            ? map_frame_ : merge_map_.header.frame_id;
+        has_map_ = true;
+    } else {
+        has_map_ = false;
+    }
+  }
+
+  void FrontierExplorerMulti::addToBlacklist(const GridPose& g) {
+    auto now = this->now();
+
+    // 만료된 항목 정리
+    blacklisted_goals_.erase(
+        std::remove_if(blacklisted_goals_.begin(), blacklisted_goals_.end(),
+            [&](const BlacklistedGoal& b) {
+                return (now - b.stamp).seconds() > blacklist_ttl_s_;
+            }),
+        blacklisted_goals_.end());
+
+    blacklisted_goals_.push_back({g, now});
+  }
+
+  bool FrontierExplorerMulti::isBlacklisted(const GridPose& g) const {
+      auto now = this->now();
+      for (const auto& b : blacklisted_goals_) {
+          if ((now - b.stamp).seconds() > blacklist_ttl_s_) continue;
+          double d = std::hypot((g.x - b.g.x) * map_.info.resolution,
+                                (g.y - b.g.y) * map_.info.resolution);
+          if (d < blacklist_radius_m_) return true;
+      }
+      return false;
   }
 
   
 
   void FrontierExplorerMulti::onTimer() {
 
+    selectActiveMap();
     if (!has_map_) return;
+
 
     if (exploration_done_) {
         publishStop("exploration done");
@@ -1525,95 +1621,65 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
     // path follow
     // -------------------------------------------------
     if (!path_.empty()) {
-
-        // 새 gate goal 들어오면
-        // 기존 경로 즉시 폐기
         if (new_gate_goal_) {
-
-            RCLCPP_WARN(
-                get_logger(),
-                "[%s] 새 Gate goal 수신 -> 기존 경로 폐기",
-                robot_id_.c_str());
-
+            RCLCPP_WARN(get_logger(), "[%s] 새 Gate goal 수신 -> 기존 경로 폐기", robot_id_.c_str());
             path_.clear();
             wp_idx_ = 0;
-
             new_gate_goal_ = false;
         }
+        else {
+            // gate/local 분기 없이 통일 (shouldReplanByIG 내부에서 gate 여부 처리함)
+            bool need_replan = shouldReplanByIG() || isRobotStuck();
 
-        else{
-          bool need_replan = false;
+            if (need_replan) {
+                RCLCPP_WARN(get_logger(), "[%s] replanning...", robot_id_.c_str());
+                addToBlacklist(current_goal_);   // 3번 항목에서 교체
+                path_.clear();
+                wp_idx_ = 0;
 
-          // Gate goal 사용하는 중이면
-          // local IG replanning 금지
-          if (has_gate_goal_) {
-              need_replan = isRobotStuck();
-          }
-          else {
-              need_replan =
-                  shouldReplanByIG() ||
-                  isRobotStuck();
-          }
+                if (has_gate_goal_) {
+                    // IG가 다 빠진 gate goal은 버리고 로컬 fallback으로 전환
+                    RCLCPP_WARN(get_logger(), "[%s] gate goal IG 소진 -> gate goal 포기, 로컬 fallback",
+                                robot_id_.c_str());
+                    has_gate_goal_ = false;
+                }
 
-          if (need_replan) {
-
-              RCLCPP_WARN(
-                  get_logger(),
-                  "[%s] replanning...",
-                  robot_id_.c_str());
-              blacklisted_goal_ = current_goal_;  // ← 추가
-              path_.clear();
-              wp_idx_ = 0;
-
-              publishStop("replan");
-
-              // ↓ return 하지 않음
-              // 아래에서 새 계획 수행
-          }
-          else {
-
-              wp_idx_ =
-                  findNearestIndexOnPath(path_, wp_idx_, 25);
-
-              followPathStep();
-              return;
-          }
-    }
-  }
-
-    // =================================================
-    // Gate goal 확인
-    // =================================================
-    bool gate_goal_valid = false;
-
-    if (has_gate_goal_) {
-
-        double dt =
-            (this->now() - last_gate_goal_time_).seconds();
-
-        if (dt > gate_timeout_s_) {
-
-            has_gate_goal_ = false;
-
-            RCLCPP_WARN(
-                get_logger(),
-                "[%s] gate goal timeout -> fallback",
-                robot_id_.c_str());
-
-        } else {
-
-            gate_goal_valid = true;
+                publishStop("replan");
+            }
+            else {
+                wp_idx_ = findNearestIndexOnPath(path_, wp_idx_, 25);
+                followPathStep();
+                return;
+            }
         }
     }
 
-    // =================================================
-    // Gate goal 우선 수행
-    // =================================================
-    if (gate_goal_valid) {
+        // =================================================
+        // Gate goal 확인
+        // =================================================
+        bool gate_goal_valid = false;
 
-        double lx = gate_goal_.pose.position.x;
-        double ly = gate_goal_.pose.position.y;
+        if (has_gate_goal_ && !using_local_map_) {   // (1) local map 전환 시 gate goal 무시
+            double dt = (this->now() - last_gate_goal_time_).seconds();
+            if (dt > gate_timeout_s_) {
+                has_gate_goal_ = false;
+                RCLCPP_WARN(get_logger(), "[%s] gate goal timeout -> fallback", robot_id_.c_str());
+            } else {
+                gate_goal_valid = true;
+            }
+        } else if (has_gate_goal_ && using_local_map_) {
+            RCLCPP_WARN(get_logger(), "[%s] local map 사용 중 -> gate goal 무시", robot_id_.c_str());
+        }
 
+        if (gate_goal_valid) {
+
+            double lx, ly;
+            if (!toLocal(gate_goal_.pose.position.x, gate_goal_.pose.position.y, lx, ly)) {  // (2) 방어적 변환
+                RCLCPP_WARN(get_logger(), "[%s] gate goal 좌표 변환 실패", robot_id_.c_str());
+                has_gate_goal_ = false;
+                publishStop("gate goal transform failed");
+                return;
+            }
 
         GridPose goal_g = worldToGrid(lx, ly);
             
@@ -1621,6 +1687,9 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
           
         if (!inBounds(goal_g.x, goal_g.y)){
           RCLCPP_WARN(get_logger(), "범위 밖!!!!");
+          has_gate_goal_ = false;
+          publishStop("gate goal out of bounds");
+          return;
         }
 
         int idx =
@@ -1635,66 +1704,55 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
             map_.data[idx],
             obsInfl[idx]);
 
-        if (inBounds(goal_g.x, goal_g.y))
-          {
+        auto astarMask = obsInfl;
+        applyKeepOpen(astarMask, robot_g);
+        applyGoalKeepOpen(astarMask, goal_g, obsRaw);
 
-                auto astarMask = obsInfl;
+        RCLCPP_WARN(
+            get_logger(),
+            "[%s] gate astar start=(%d,%d) goal=(%d,%d)",
+            robot_id_.c_str(),
+            robot_g.x, robot_g.y,
+            goal_g.x, goal_g.y);
 
-                applyKeepOpen(astarMask, robot_g);
-                applyGoalKeepOpen(astarMask, goal_g);
+        auto new_path = astar(robot_g, goal_g, astarMask);
 
-                RCLCPP_WARN(
-                  get_logger(),
-                  "[%s] gate astar start=(%d,%d) goal=(%d,%d)",
-                  robot_id_.c_str(),
-                  robot_g.x,
-                  robot_g.y,
-                  goal_g.x,
-                  goal_g.y);
+        if (!new_path.empty()) {
 
-                auto new_path =
-                    astar(robot_g, goal_g, astarMask);
+            RCLCPP_INFO(get_logger(), "[%s] gate path success", robot_id_.c_str());
 
-                if (!new_path.empty()) {
+            gate_plan_fail_count_ = 0;   // 성공했으니 실패 카운트 리셋
 
-                    RCLCPP_INFO(
-                        get_logger(),
-                        "[%s] gate path success",
-                        robot_id_.c_str());
+            path_ = std::move(new_path);
+            wp_idx_ = 0;
+            progress_inited_ = false;
+            current_goal_ = goal_g;
+            has_goal_ = true;
+            goal_commit_start_ = this->now();
 
-                    path_ = std::move(new_path);
+            if (enable_viz_) publishPathMarker(path_);
 
-                    wp_idx_ = 0;
-
-                    progress_inited_ = false;
-
-                    current_goal_ = goal_g;
-
-                    has_goal_ = true;
-
-                    goal_commit_start_ = this->now();
-
-                    // ❌ 절대 false 하지 마
-                    // has_gate_goal_ = false;
-
-                    if (enable_viz_)
-                        publishPathMarker(path_);
-
-                    followPathStep();
-
-                    return;
-                }
+            followPathStep();
+            return;
         }
 
+        // A* 실패 -> 바로 포기하지 않고 연속 실패 횟수 카운트
+        gate_plan_fail_count_++;
 
-      RCLCPP_WARN(
-          get_logger(),
-          "[%s] gate planning failed -> retry",
-          robot_id_.c_str());
-      has_gate_goal_ = false;  // ← 이거 추가
-      publishStop("gate retry");
+        RCLCPP_WARN(
+            get_logger(),
+            "[%s] gate planning failed (%d/%d)",
+            robot_id_.c_str(), gate_plan_fail_count_, gate_plan_fail_max_);
 
-      return;
+        if (gate_plan_fail_count_ >= gate_plan_fail_max_) {
+            RCLCPP_WARN(get_logger(), "[%s] gate 연속 실패 한도 초과 -> gate goal 포기",
+                        robot_id_.c_str());
+            has_gate_goal_ = false;
+            gate_plan_fail_count_ = 0;
+        }
+
+        publishStop("gate retry");
+        return;
     }
 
     // =================================================
@@ -1733,7 +1791,7 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
             }),
         frontiers.end());
      
-      RCLCPP_WARN(get_logger(), "[%s] after clearance: %d", robot_id_.c_str(), (int)frontiers.size());
+      // RCLCPP_WARN(get_logger(), "[%s] after clearance: %d", robot_id_.c_str(), (int)frontiers.size());
 
     if (frontiers.empty()) {
 
@@ -1754,7 +1812,7 @@ FrontierExplorerMulti ::FrontierExplorerMulti()
     filterFrontiersByReachable(
         frontiers,
         reachable);
-        RCLCPP_WARN(get_logger(), "[%s] after reachable: %d", robot_id_.c_str(), (int)frontiers.size());
+        // RCLCPP_WARN(get_logger(), "[%s] after reachable: %d", robot_id_.c_str(), (int)frontiers.size());
 
     if (frontiers.empty()) {
 
