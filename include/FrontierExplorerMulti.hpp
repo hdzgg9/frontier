@@ -31,6 +31,9 @@
 #include <unordered_set>
 #include <random>
 
+#include "frontier_ws/msg/dynamic_obstacle.hpp"
+#include "controller.hpp"
+
 static constexpr int UNKNOWN = -1;
 
 struct GridPose { int x{0}, y{0}; };
@@ -285,6 +288,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr explore_done_sub_;
     bool exploration_done_{false};
 
+
     // 추가 | A* 연속 실패 카운트용
     int gate_plan_fail_count_{0};
     int gate_plan_fail_max_{3};
@@ -303,6 +307,13 @@ private:
 
     void onLocalMap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
     void selectActiveMap();
+
+    // controller
+    rclcpp::Subscription<frontier_ws::msg::DynamicObstacle>::SharedPtr obs_sub_;
+    std::shared_ptr<Controller> controller;
+    void obsCallback(const frontier_ws::msg::DynamicObstacle::SharedPtr msg);
+
+
 };
 
 #endif // FRONTIER_EXPLORER_MULTI_HPP_
